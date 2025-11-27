@@ -39,6 +39,7 @@ These models support FP8 quantization with the `flashinfer_trtllm` MoE backend.
 - ⚠️ TP8 requires `--ep 2` to satisfy: `(moe_intermediate_size / (tp_size / ep_size)) % weight_block_size_n == 0`
   - Without EP: `moe_intermediate_size / 8` may not be divisible by 128
   - With EP=2: `moe_intermediate_size / 4` is divisible by 128
+- ⚠️ **Qwen 235B only**: Add `--mem-fraction-static 0.8` to prevent CUDA graph capture failures on TP4
 
 ---
 
@@ -146,6 +147,15 @@ torch.OutOfMemoryError: CUDA out of memory.
 TimeoutError: Server failed to start within the timeout period.
 ```
 **Solution:** Increase timeout to 2000 seconds (33 minutes) for large model downloads
+
+### Error: CUDA graph capture failure
+```
+Exception: Capture cuda graph failed: No supported CUDA architectures found for major versions [10].
+Possible solutions:
+1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)
+2. set --cuda-graph-max-bs to a smaller value (e.g., 16)
+```
+**Solution:** Add `--mem-fraction-static 0.8` to reduce static memory allocation
 
 ---
 

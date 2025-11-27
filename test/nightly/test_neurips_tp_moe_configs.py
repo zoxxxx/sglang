@@ -59,7 +59,13 @@ MODELS = {
         "path": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
         "is_moe": True,
         "use_fp8": True,
-        "extra_args": ["--trust-remote-code", "--quantization", "fp8"],
+        "extra_args": [
+            "--trust-remote-code",
+            "--quantization",
+            "fp8",
+            "--mem-fraction-static",
+            "0.8",
+        ],
     },
     "qwen3-coder-480b": {
         "path": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",

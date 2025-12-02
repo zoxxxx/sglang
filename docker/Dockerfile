@@ -293,12 +293,12 @@ RUN CMAKE_VERSION=3.31.1 \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
-# Build and install sgl-router (Rust toolchain removed after build to save space)
+# Build and install sgl-model-gateway (Rust toolchain removed after build to save space)
 RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
     && python3 -m pip install maturin \
-    && cd /sgl-workspace/sglang/sgl-router/bindings/python \
+    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \

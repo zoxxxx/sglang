@@ -484,6 +484,14 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
+        if not hasattr(self.gate_up_proj, "weight"):
+            if hasattr(self.gate_up_proj, "weight_packed"):
+                self.gate_up_proj.weight = self.gate_up_proj.weight_packed
+
+        if not hasattr(self.down_proj, "weight"):
+            if hasattr(self.down_proj, "weight_packed"):
+                self.down_proj.weight = self.down_proj.weight_packed
+
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -3767,16 +3775,27 @@ class DeepseekV2ForCausalLM(nn.Module):
                             ):
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
+
+                                if q_a_proj_weight.shape == torch.Size(
+                                    []
+                                ) and kv_a_proj_weight.shape == torch.Size([]):
+                                    fused_weight = q_a_proj_weight
+                                else:
+                                    cat_dim = 0
+                                    if self.quant_config is not None and (
+                                        self.quant_config.get_name() == "awq"
+                                        or self.quant_config.get_name() == "awq_marlin"
+                                        or self.quant_config.get_name() == "moe_wna16"
+                                    ):
+                                        if q_a_proj_weight.shape[0] == kv_a_proj_weight.shape[0]:
+                                            cat_dim = 1
+                                        else:
+                                            cat_dim = 0
+
+                                    fused_weight = torch.cat(
+                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                    )
+
                                 param_name = (
                                     name.replace(
                                         "q_a_proj", "fused_qkv_a_proj_with_mqa"

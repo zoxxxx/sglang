@@ -7,6 +7,7 @@ import ipaddress
 import logging
 import random
 import urllib
+import uuid
 import warnings
 from http import HTTPStatus
 from itertools import chain
@@ -48,6 +49,7 @@ class MiniLoadBalancer:
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
         self.test_external_dp_routing = router_args.test_external_dp_routing
+        self.pd_host_kv_pool = router_args.pd_host_kv_pool
         self.prefill_dp_size = None
         self.decode_dp_size = None
 
@@ -100,6 +102,23 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
+    def _fork_host_kv_requests(self, request):
+        if self.prefill_dp_size <= 0 or self.decode_dp_size <= 0:
+            raise ValueError(
+                "MiniLB Host KV mode requires non-empty prefill/decode DP workers"
+            )
+
+        p_rank = random.randint(0, self.prefill_dp_size - 1)
+        d_rank = random.randint(0, self.decode_dp_size - 1)
+
+        prefill_req = request.copy()
+        decode_req = request.copy()
+        prefill_req["routed_dp_rank"] = p_rank
+        decode_req["routed_dp_rank"] = d_rank
+        decode_req["disagg_prefill_dp_rank"] = p_rank
+
+        return prefill_req, decode_req, d_rank
+
     def select_pair(self):
         assert len(self.prefill_urls) > 0, "No prefill servers available"
         assert len(self.decode_urls) > 0, "No decode servers available"
@@ -117,7 +136,14 @@ class MiniLoadBalancer:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         expected_decode_dp_rank = None
-        if self.test_external_dp_routing:
+        if self.pd_host_kv_pool:
+            await self._ensure_dp_sizes()
+            prefill_req, decode_req, routed_dp_rank = self._fork_host_kv_requests(
+                modified_request
+            )
+            if self.test_external_dp_routing:
+                expected_decode_dp_rank = routed_dp_rank
+        elif self.test_external_dp_routing:
             await self._ensure_dp_sizes()
             prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
                 modified_request
@@ -132,17 +158,38 @@ class MiniLoadBalancer:
             )  # Add timeout for request reliability
         ) as session:
 
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
+            prefill_body = None
+            if self.pd_host_kv_pool:
+                prefill_response = await session.post(
+                    f"{prefill_server}/{endpoint}", json=prefill_req
+                )
+                prefill_body = await prefill_response.read()
+                if prefill_response.status >= 400:
+                    return ORJSONResponse(
+                        content=orjson.loads(prefill_body)
+                        if prefill_body
+                        else {"error": "prefill failed"},
+                        status_code=prefill_response.status,
+                    )
+                decode_response = await session.post(
+                    f"{decode_server}/{endpoint}", json=decode_req
+                )
+            else:
+                tasks = [
+                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                ]
 
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+                # Wait for both responses to complete. Prefill should end first.
+                prefill_response, decode_response = await asyncio.gather(*tasks)
 
             if "return_logprob" in modified_request:
 
-                prefill_json = await prefill_response.json()
+                prefill_json = (
+                    orjson.loads(prefill_body)
+                    if prefill_body is not None
+                    else await prefill_response.json()
+                )
                 ret_json = await decode_response.json()
 
                 # merge `meta_info.input_token_logprobs` from prefill to decode
@@ -178,6 +225,12 @@ class MiniLoadBalancer:
             warnings.warn("--test-external-dp-routing is not supported with streaming")
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+        if self.pd_host_kv_pool:
+            await self._ensure_dp_sizes()
+            prefill_req, decode_req, _ = self._fork_host_kv_requests(modified_request)
+        else:
+            prefill_req = modified_request
+            decode_req = modified_request
 
         async def stream_results():
             async with aiohttp.ClientSession(
@@ -185,19 +238,40 @@ class MiniLoadBalancer:
                     total=self.timeout
                 )  # Add timeout for request reliability
             ) as session:
-                # Create the tasks for both prefill and decode requests
-                tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
-                ]
+                prefill_chunks = None
+                if self.pd_host_kv_pool:
+                    prefill_response = await session.post(
+                        f"{prefill_server}/{endpoint}", json=prefill_req
+                    )
+                    prefill_chunks = [
+                        chunk async for chunk in prefill_response.content
+                    ]
+                    if prefill_response.status >= 400:
+                        for chunk in prefill_chunks:
+                            yield chunk
+                        return
+                    decode_response = await session.post(
+                        f"{decode_server}/{endpoint}", json=decode_req
+                    )
+                else:
+                    # Create the tasks for both prefill and decode requests
+                    tasks = [
+                        session.post(
+                            f"{prefill_server}/{endpoint}", json=prefill_req
+                        ),
+                        session.post(
+                            f"{decode_server}/{endpoint}", json=decode_req
+                        ),
+                    ]
 
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                    # Wait for both responses to complete. Since this is streaming, they return immediately.
+                    prefill_response, decode_response = await asyncio.gather(*tasks)
 
                 if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                    if prefill_chunks is None:
+                        prefill_chunks = []
+                        async for chunk in prefill_response.content:
+                            prefill_chunks.append(chunk)
 
                     first_prefill_chunk = (
                         prefill_chunks[0].decode("utf-8")[5:].strip("\n")
@@ -255,6 +329,20 @@ async def health_generate():
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
     return Response(status_code=200)
+
+
+@app.get("/workers")
+async def workers():
+    prefill_urls = lb.prefill_urls if lb else []
+    decode_urls = lb.decode_urls if lb else []
+    return {
+        "prefill": [{"url": url} for url in prefill_urls],
+        "decode": [{"url": url} for url in decode_urls],
+        "stats": {
+            "prefill_count": len(prefill_urls),
+            "decode_count": len(decode_urls),
+        },
+    }
 
 
 @app.post("/flush_cache")
@@ -364,23 +452,23 @@ async def handle_generate_request(request_data: dict):
 
     batch_size = _get_request_batch_size(modified_request)
     if batch_size is not None:
-        modified_request.update(
-            {
-                "bootstrap_host": [hostname] * batch_size,
-                "bootstrap_port": [bootstrap_port] * batch_size,
-                "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
-                ],
-            }
-        )
+        update = {
+            "bootstrap_host": [hostname] * batch_size,
+            "bootstrap_port": [bootstrap_port] * batch_size,
+            "bootstrap_room": [_generate_bootstrap_room() for _ in range(batch_size)],
+        }
+        if lb.pd_host_kv_pool:
+            update["host_kv_id"] = [_generate_host_kv_id() for _ in range(batch_size)]
+        modified_request.update(update)
     else:
-        modified_request.update(
-            {
-                "bootstrap_host": hostname,
-                "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
-            }
-        )
+        update = {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": _generate_bootstrap_room(),
+        }
+        if lb.pd_host_kv_pool:
+            update["host_kv_id"] = _generate_host_kv_id()
+        modified_request.update(update)
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
@@ -399,13 +487,14 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = maybe_wrap_ipv6_address(parsed_url.hostname)
     modified_request = request_data.copy()
-    modified_request.update(
-        {
-            "bootstrap_host": hostname,
-            "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
-        }
-    )
+    update = {
+        "bootstrap_host": hostname,
+        "bootstrap_port": bootstrap_port,
+        "bootstrap_room": _generate_bootstrap_room(),
+    }
+    if lb.pd_host_kv_pool:
+        update["host_kv_id"] = _generate_host_kv_id()
+    modified_request.update(update)
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
@@ -435,6 +524,10 @@ async def handle_completion_request(request_data: dict):
 
 def _generate_bootstrap_room():
     return random.randint(0, 2**63 - 1)
+
+
+def _generate_host_kv_id():
+    return uuid.uuid4().hex
 
 
 # We may utilize `GenerateReqInput`'s logic later

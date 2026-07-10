@@ -99,6 +99,8 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    #[serde(default)]
+    pub pd_host_kv_pool: bool,
 }
 
 /// Tokenizer cache configuration
@@ -551,6 +553,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            pd_host_kv_pool: false,
             server_cert: None,
             server_key: None,
         }

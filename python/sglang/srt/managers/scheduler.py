@@ -2031,6 +2031,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                host_kv_id=recv_req.host_kv_id,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -2053,10 +2054,26 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not self.server_args.disaggregation_host_kv_pool
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
+                    )
+                    logger.error(error_msg)
+                    recv_req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": error_msg}
+                    )
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.stream_output([req], req.return_logprob)
+                    return
+                if (
+                    self.server_args.disaggregation_host_kv_pool
+                    and recv_req.host_kv_id is None
+                ):
+                    error_msg = (
+                        f"Invalid request: Host KV Pool request received without "
+                        f"host_kv_id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     recv_req.time_stats.trace_ctx.abort(

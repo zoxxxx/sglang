@@ -204,6 +204,7 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    host_kv_id: Optional[Union[List[str], str]] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
@@ -607,6 +608,25 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+        # Normalize host_kv_id
+        if self.host_kv_id is None:
+            self.host_kv_id = [None] * num
+        elif not isinstance(self.host_kv_id, list):
+            self.host_kv_id = (
+                [f"{self.host_kv_id}-{i}" for i in range(num)]
+                if self.parallel_sample_num > 1
+                else [self.host_kv_id] * num
+            )
+        elif isinstance(self.host_kv_id, list):
+            if self.parallel_sample_num > 1:
+                self.host_kv_id = [
+                    f"{host_kv_id}-{sample_idx}" if host_kv_id is not None else None
+                    for sample_idx in range(self.parallel_sample_num)
+                    for host_kv_id in self.host_kv_id
+                ]
+            else:
+                self.host_kv_id = self.host_kv_id * self.parallel_sample_num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -685,6 +705,7 @@ class GenerateReqInput(BaseReq):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
+            host_kv_id=self.host_kv_id[i] if self.host_kv_id is not None else None,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
@@ -761,6 +782,7 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    host_kv_id: Optional[str] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False

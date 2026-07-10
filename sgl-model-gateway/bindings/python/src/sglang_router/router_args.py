@@ -45,6 +45,7 @@ class RouterArgs:
     mini_lb: bool = False
     test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
+    pd_host_kv_pool: bool = False  # Enable host-centric KV ownership in PD mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
@@ -382,6 +383,12 @@ class RouterArgs:
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-host-kv-pool",
+            action="store_true",
+            help="Enable experimental host-centric KV ownership in PD mode. "
+            "The router sends prefill first, then late-attaches decode with host_kv_id.",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",
@@ -1020,6 +1027,8 @@ class RouterArgs:
 
     def _validate_router_args(self):
         # Validate configuration based on mode
+        if self.pd_host_kv_pool and not self.pd_disaggregation:
+            raise ValueError("--pd-host-kv-pool requires --pd-disaggregation")
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:

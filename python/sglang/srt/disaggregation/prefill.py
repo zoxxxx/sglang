@@ -29,6 +29,7 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.host_kv_pool import HostKVPoolRuntime, HostKVSender
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -126,6 +127,11 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
+        self.host_kv_pool_runtime = (
+            HostKVPoolRuntime.get_or_create(scheduler)
+            if scheduler.server_args.disaggregation_host_kv_pool
+            else None
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
@@ -223,22 +229,27 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
-        backend = (
-            TransferBackend.FAKE
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
-            else self.transfer_backend
-        )
-        kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
+        if self.scheduler.server_args.disaggregation_host_kv_pool:
+            req.disagg_kv_sender = HostKVSender(
+                self.host_kv_pool_runtime, req, self.metadata_buffers
+            )
+        else:
+            backend = (
+                TransferBackend.FAKE
+                if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
+                else self.transfer_backend
+            )
+            kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        dest_tp_ranks = [self.tp_rank]
+            dest_tp_ranks = [self.tp_rank]
 
-        req.disagg_kv_sender = kv_sender_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
-            bootstrap_room=req.bootstrap_room,
-            dest_tp_ranks=dest_tp_ranks,
-            pp_rank=self.pp_rank,
-        )
+            req.disagg_kv_sender = kv_sender_class(
+                mgr=self.kv_manager,
+                bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                dest_tp_ranks=dest_tp_ranks,
+                pp_rank=self.pp_rank,
+            )
         self._process_req(req)
         self.queue.append(req)
 

@@ -5,6 +5,13 @@ pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if config.pd_host_kv_pool && !matches!(config.mode, RoutingMode::PrefillDecode { .. }) {
+            return Err(ConfigError::InvalidValue {
+                field: "pd_host_kv_pool".to_string(),
+                value: "true".to_string(),
+                reason: "pd_host_kv_pool requires PrefillDecode routing mode".to_string(),
+            });
+        }
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;

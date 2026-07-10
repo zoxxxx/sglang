@@ -378,6 +378,7 @@ struct Router {
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    pd_host_kv_pool: bool,
     bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -643,6 +644,7 @@ impl Router {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .dp_aware(self.dp_aware)
+            .pd_host_kv_pool(self.pd_host_kv_pool)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
@@ -701,6 +703,7 @@ impl Router {
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
+        pd_host_kv_pool = false,
         bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
@@ -793,6 +796,7 @@ impl Router {
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        pd_host_kv_pool: bool,
         bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -898,6 +902,7 @@ impl Router {
             shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
+            pd_host_kv_pool,
             bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,

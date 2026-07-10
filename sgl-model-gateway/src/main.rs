@@ -199,6 +199,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
+    /// Enable host-centric KV ownership in PD mode
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pd_host_kv_pool: bool,
+
     /// Decode server URLs (can be specified multiple times)
     #[arg(long, action = ArgAction::Append, help_heading = "PD Disaggregation")]
     decode: Vec<String>,
@@ -1010,6 +1014,7 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .pd_host_kv_pool(self.pd_host_kv_pool)
             .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
             .connect_timeout_secs(self.connect_timeout_secs)
             .pool_max_idle_per_host(self.pool_max_idle_per_host)

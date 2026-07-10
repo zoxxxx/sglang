@@ -798,6 +798,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_host_kv_pool: bool = False
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
@@ -3457,6 +3458,7 @@ class ServerArgs:
         if not (
             self.enable_hierarchical_cache
             or self.disaggregation_decode_enable_offload_kvcache
+            or self.disaggregation_host_kv_pool
         ):
             return
 
@@ -4041,6 +4043,37 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        if self.disaggregation_host_kv_pool:
+            if self.disaggregation_mode not in ("prefill", "decode"):
+                raise ValueError(
+                    "--disaggregation-host-kv-pool requires "
+                    "--disaggregation-mode prefill or decode"
+                )
+            if self.hicache_storage_backend != "mooncake":
+                raise ValueError(
+                    "--disaggregation-host-kv-pool requires "
+                    "--hicache-storage-backend mooncake"
+                )
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--disaggregation-host-kv-pool is incompatible with --enable-hisparse"
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--disaggregation-host-kv-pool MVP is incompatible with "
+                    f"speculative decoding ({self.speculative_algorithm})"
+                )
+            if self.disaggregation_decode_enable_radix_cache:
+                raise ValueError(
+                    "--disaggregation-host-kv-pool MVP is incompatible with "
+                    "--disaggregation-decode-enable-radix-cache"
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "--disaggregation-host-kv-pool MVP is incompatible with "
+                    "--disaggregation-decode-enable-offload-kvcache"
+                )
+
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
                 if self.enable_hisparse:
@@ -6893,6 +6926,13 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-host-kv-pool",
+            action="store_true",
+            help="Enable experimental host-centric KV ownership for PD disaggregation. "
+            "Prefill writes sealed KV objects into a Mooncake-backed Host KV Pool; "
+            "decode workers attach the object into temporary HBM before decode.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",

@@ -53,6 +53,25 @@ class TestRouterConfigValidation:
         assert args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
         assert args.policy == "cache_aware"
 
+    def test_pd_host_kv_pool_requires_pd_mode(self):
+        """Test that host-centric KV routing is only valid in PD mode."""
+        args = RouterArgs(pd_host_kv_pool=True)
+
+        with pytest.raises(ValueError, match="requires --pd-disaggregation"):
+            args._validate_router_args()
+
+    def test_valid_pd_host_kv_pool_config(self):
+        """Test that host-centric KV routing is accepted for valid PD configs."""
+        args = RouterArgs(
+            pd_disaggregation=True,
+            pd_host_kv_pool=True,
+            prefill_urls=[("http://prefill1:8000", 9000)],
+            decode_urls=["http://decode1:8001"],
+        )
+
+        args._validate_router_args()
+        assert args.pd_host_kv_pool is True
+
     def test_pd_config_without_urls_allowed(self):
         """Test that PD mode without URLs is now allowed (URLs are optional)."""
         args = RouterArgs(

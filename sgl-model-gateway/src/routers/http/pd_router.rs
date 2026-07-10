@@ -1,4 +1,5 @@
 use std::{sync::Arc, time::Instant};
+use uuid::Uuid;
 
 use async_trait::async_trait;
 use axum::{
@@ -52,6 +53,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub pd_host_kv_pool: bool,
 }
 
 #[derive(Clone)]
@@ -165,6 +167,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            pd_host_kv_pool: ctx.router_config.pd_host_kv_pool,
         })
     }
 
@@ -213,11 +216,13 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const HOST_KV_ID_KEY: &'static str = "host_kv_id";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
+        host_kv_pool: bool,
     ) -> Result<Value, String> {
         let obj = original
             .as_object_mut()
@@ -253,6 +258,12 @@ impl PDRouter {
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
+            if host_kv_pool {
+                let host_kv_ids = (0..n)
+                    .map(|_| Value::from(Uuid::new_v4().to_string()))
+                    .collect();
+                obj.insert(Self::HOST_KV_ID_KEY.to_string(), Value::Array(host_kv_ids));
+            }
         } else {
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -270,6 +281,12 @@ impl PDRouter {
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::from(super::pd_types::generate_room_id()),
             );
+            if host_kv_pool {
+                obj.insert(
+                    Self::HOST_KV_ID_KEY.to_string(),
+                    Value::from(Uuid::new_v4().to_string()),
+                );
+            }
         }
         Ok(original)
     }
@@ -336,6 +353,7 @@ impl PDRouter {
                             json_request,
                             prefill.as_ref(),
                             context.batch_size,
+                            self.pd_host_kv_pool,
                         ) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
@@ -567,6 +585,108 @@ impl PDRouter {
             headers,
             false,
         );
+
+        if self.pd_host_kv_pool {
+            events::RequestPDSentEvent {
+                prefill_url: prefill.url(),
+                decode_url: decode.url(),
+            }
+            .emit();
+
+            let prefill_result = prefill_request.send().await;
+            let prefill_body = match self
+                .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+                .await
+            {
+                Ok((_, body)) => body,
+                Err(error_response) => return error_response,
+            };
+
+            let decode_result = decode_request.send().await;
+            events::RequestReceivedEvent {}.emit();
+
+            return match decode_result {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    debug!("Decode response status: {}", status);
+
+                    if !status.is_success() {
+                        error!(
+                            "Decode server returned error status decode_url={} status={}",
+                            decode.url(),
+                            status
+                        );
+
+                        return self
+                            .handle_decode_error_response(res, &context, prefill, decode)
+                            .await;
+                    }
+
+                    if context.is_stream {
+                        let prefill_logprobs = if context.return_logprob {
+                            prefill_body
+                                .as_ref()
+                                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                                .and_then(|json| {
+                                    json.pointer("/meta_info/input_token_logprobs").cloned()
+                                })
+                        } else {
+                            None
+                        };
+
+                        let response_headers =
+                            header_utils::preserve_response_headers(res.headers());
+
+                        self.create_streaming_response(
+                            res.bytes_stream(),
+                            status,
+                            prefill_logprobs,
+                            context.return_logprob,
+                            None,
+                            Some(response_headers),
+                            prefill,
+                            decode,
+                        )
+                    } else if context.return_logprob {
+                        self.process_non_streaming_response(
+                            res,
+                            status,
+                            context.return_logprob,
+                            prefill_body,
+                        )
+                        .await
+                    } else {
+                        let response_headers =
+                            header_utils::preserve_response_headers(res.headers());
+
+                        match res.bytes().await {
+                            Ok(decode_body) => {
+                                let mut response = Response::new(Body::from(decode_body));
+                                *response.status_mut() = status;
+                                *response.headers_mut() = response_headers;
+                                response
+                            }
+                            Err(e) => {
+                                error!("Failed to read decode response: {}", e);
+                                error::internal_error(
+                                    "read_response_failed",
+                                    "Failed to read response",
+                                )
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        decode_url = %decode.url(),
+                        error = %e,
+                        "Decode request failed"
+                    );
+                    error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
+                }
+            };
+        }
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation

@@ -36,6 +36,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.host_kv_pool import HostKVPoolRuntime, HostKVReceiver
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -303,6 +304,11 @@ class DecodePreallocQueue:
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.host_kv_pool_runtime = (
+            HostKVPoolRuntime.get_or_create(scheduler)
+            if scheduler.server_args.disaggregation_host_kv_pool
+            else None
+        )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -456,6 +462,9 @@ class DecodePreallocQueue:
         else:
             decode_req = self._create_receiver_and_enqueue(req)
 
+            if self.scheduler.server_args.disaggregation_host_kv_pool:
+                return
+
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
                 decode_req.kv_receiver.init(0)
@@ -510,6 +519,16 @@ class DecodePreallocQueue:
         return None
 
     def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
+        if self.scheduler.server_args.disaggregation_host_kv_pool:
+            kv_receiver = HostKVReceiver(
+                self.host_kv_pool_runtime, req, self.metadata_buffers
+            )
+            decode_req = DecodeRequest(
+                req=req, kv_receiver=kv_receiver, waiting_for_input=True
+            )
+            self.queue.append(decode_req)
+            return decode_req
+
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -1407,7 +1426,13 @@ class DecodeTransferQueue:
             else 0
         )
 
-        if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+        if (
+            _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+            or (
+                self.scheduler.server_args.disaggregation_host_kv_pool
+                and decode_req.req.host_kv_id is not None
+            )
+        ):
             pass
         elif actual_room == 0:
             # Case 1: Metadata not ready yet (actual_room == 0)

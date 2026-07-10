@@ -300,6 +300,7 @@ async fn generate_handler(
 ) -> Response {
     let config = config.read().await;
     let worker_id = format!("worker-{}", config.port);
+    store_generate_payload_for_port(config.port, payload.clone());
 
     if should_fail(&config).await {
         return (
@@ -1197,9 +1198,28 @@ async fn responses_cancel_handler(
 
 // --- Simple in-memory response store per worker port (for tests) ---
 static RESP_STORE: OnceLock<Mutex<HashMap<u16, HashSet<String>>>> = OnceLock::new();
+static GENERATE_PAYLOAD_STORE: OnceLock<Mutex<HashMap<u16, Vec<serde_json::Value>>>> =
+    OnceLock::new();
 
 fn get_store() -> &'static Mutex<HashMap<u16, HashSet<String>>> {
     RESP_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_generate_payload_store() -> &'static Mutex<HashMap<u16, Vec<serde_json::Value>>> {
+    GENERATE_PAYLOAD_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_generate_payload_for_port(port: u16, payload: serde_json::Value) {
+    let mut map = get_generate_payload_store().lock().unwrap();
+    map.entry(port).or_default().push(payload);
+}
+
+pub fn take_generate_payloads_for_port(port: u16) -> Vec<serde_json::Value> {
+    get_generate_payload_store()
+        .lock()
+        .unwrap()
+        .remove(&port)
+        .unwrap_or_default()
 }
 
 fn store_response_for_port(port: u16, response_id: &str) {

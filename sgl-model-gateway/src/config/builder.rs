@@ -491,6 +491,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_host_kv_pool(mut self, enable: bool) -> Self {
+        self.config.pd_host_kv_pool = enable;
+        self
+    }
+
     // ==================== Option Setters ====================
     // Accept Option<T> and only set if Some
 

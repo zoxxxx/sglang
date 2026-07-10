@@ -552,6 +552,9 @@ class DecodePreallocQueue:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
+            self.scheduler.maybe_release_host_kv_object(
+                req, "decode_capacity_rejected"
+            )
             return True
         if self._uses_swa_tail_prealloc():
             _, swa_required = self._prealloc_required_tokens(req)
@@ -564,6 +567,9 @@ class DecodePreallocQueue:
                 logger.error(message)
                 prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
                 self.scheduler.stream_output([req], req.return_logprob)
+                self.scheduler.maybe_release_host_kv_object(
+                    req, "decode_capacity_rejected"
+                )
                 return True
         return False
 
@@ -1539,6 +1545,9 @@ class DecodeTransferQueue:
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                self.scheduler.maybe_release_host_kv_object(
+                    decode_req.req, "decode_transfer_failed"
+                )
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
@@ -1557,6 +1566,9 @@ class DecodeTransferQueue:
                             self.scheduler.hisparse_coordinator.request_finished(
                                 decode_req.req
                             )
+                        self.scheduler.maybe_release_host_kv_object(
+                            decode_req.req, "decode_metadata_corruption"
+                        )
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )

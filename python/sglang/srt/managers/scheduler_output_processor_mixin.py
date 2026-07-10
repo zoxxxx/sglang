@@ -646,6 +646,7 @@ class SchedulerOutputProcessorMixin:
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
             self.maybe_collect_indexer_topk(req)
+            self.maybe_release_host_kv_object(req, "decode_finished")
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

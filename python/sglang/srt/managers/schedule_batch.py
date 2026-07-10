@@ -886,6 +886,8 @@ class Req(ReqDllmMixin):
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.host_kv_id: Optional[str] = host_kv_id
+        self.host_kv_object_info: Optional[Any] = None
+        self.host_kv_release_scheduled = False
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
@@ -1324,6 +1326,12 @@ class Req(ReqDllmMixin):
             f"type={self.time_stats.disagg_mode_str()})"
         )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+        sender = getattr(self, "disagg_kv_sender", None)
+        get_debug_stats = getattr(sender, "get_debug_stats", None)
+        if get_debug_stats is not None:
+            debug_stats = get_debug_stats()
+            if debug_stats:
+                logger.info(f"ReqTransferStats(rid={self.rid}): {debug_stats}")
         self.has_log_time_stats = True
 
     def set_extend_input_len(self, extend_input_len: int):

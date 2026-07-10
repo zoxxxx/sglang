@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import re
 import struct
 import threading
 import time
@@ -80,6 +81,7 @@ class _HostKVPushResult:
     kv_put_s: float
     state_put_s: float
     metadata_put_s: float
+    task_latency_s: float
     transfer_total_bytes: int
 
 
@@ -147,7 +149,9 @@ class HostKVPoolRuntime:
                 "Mooncake storage."
             )
         if getattr(controller, "storage_backend", None) is None:
-            raise RuntimeError("Host KV Pool requires an attached Mooncake storage backend")
+            raise RuntimeError(
+                "Host KV Pool requires an attached Mooncake storage backend"
+            )
 
     def _build_private_controller(self) -> HiCacheController:
         kv_cache = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
@@ -261,7 +265,7 @@ class HostKVPoolRuntime:
             self._push_stream = get_device_module().Stream()
         return self._push_stream
 
-    def submit_push(self, fn: Callable[[], _HostKVPushResult]) -> Future:
+    def submit_push(self, fn: Callable[[], object]) -> Future:
         if self._push_executor is None:
             with self._push_executor_lock:
                 if self._push_executor is None:
@@ -270,6 +274,88 @@ class HostKVPoolRuntime:
                         thread_name_prefix=f"host-kv-push-tp{self.tp_rank}",
                     )
         return self._push_executor.submit(fn)
+
+    def schedule_release(self, req: Req, reason: str) -> Optional[Future]:
+        """Remove one logical Host KV Object after its request lifetime ends."""
+        host_kv_id = getattr(req, "host_kv_id", None)
+        if host_kv_id is None or getattr(req, "host_kv_release_scheduled", False):
+            return None
+
+        object_info = getattr(req, "host_kv_object_info", None)
+        source_tp_rank = (
+            object_info.tp_rank
+            if object_info is not None
+            else self._source_tp_rank(req)
+        )
+        source_pp_rank = (
+            object_info.pp_rank if object_info is not None else self.pp_rank
+        )
+        prefix = f"{self._object_prefix(host_kv_id, source_tp_rank, source_pp_rank)}:"
+        tag_keys = getattr(self.storage, "_tag_keys", None)
+        if tag_keys is not None:
+            prefix = tag_keys([prefix])[0]
+        pattern = f"{re.escape(prefix)}.*"
+        rid = getattr(req, "rid", "unknown")
+        req.host_kv_release_scheduled = True
+
+        def remove_object():
+            remove_by_regex = getattr(self.storage.store, "remove_by_regex", None)
+            if remove_by_regex is None:
+                raise RuntimeError(
+                    "Mooncake Host KV lifecycle cleanup requires remove_by_regex"
+                )
+            start = time.perf_counter()
+            last_error = None
+            for attempt in range(3):
+                try:
+                    result = remove_by_regex(pattern, True)
+                    if result >= 0:
+                        return result, time.perf_counter() - start
+                    last_error = RuntimeError(
+                        f"Mooncake Host KV object removal failed with code {result}"
+                    )
+                except BaseException as exc:
+                    last_error = exc
+                if attempt < 2:
+                    time.sleep(0.05 * (2**attempt))
+            assert last_error is not None
+            raise last_error
+
+        try:
+            future = self.submit_push(remove_object)
+        except BaseException:
+            req.host_kv_release_scheduled = False
+            logger.exception(
+                "Failed to schedule Host KV object release for rid=%s host_kv_id=%s",
+                rid,
+                host_kv_id,
+            )
+            return None
+
+        def log_result(done: Future) -> None:
+            try:
+                result, latency_s = done.result()
+                logger.info(
+                    "HostKVReleaseStats(rid=%s, host_kv_id=%s, reason=%s): "
+                    "result=%s, latency=%.2fms",
+                    rid,
+                    host_kv_id,
+                    reason,
+                    result,
+                    latency_s * 1000,
+                )
+            except BaseException:
+                logger.exception(
+                    "Host KV object release failed for rid=%s host_kv_id=%s "
+                    "reason=%s pattern=%s",
+                    rid,
+                    host_kv_id,
+                    reason,
+                    pattern,
+                )
+
+        future.add_done_callback(log_result)
+        return future
 
     def _object_prefix(
         self,
@@ -345,8 +431,8 @@ class HostKVPoolRuntime:
                         "Host KV Pool staging allocation failed while backing up "
                         "prefill KV"
                     )
-                moved_host_indices, moved_device_indices = (
-                    self.controller.move_indices(host_indices, device_indices)
+                moved_host_indices, moved_device_indices = self.controller.move_indices(
+                    host_indices, device_indices
                 )
                 keys = self._page_keys(host_kv_id, start_page, num_pages)
                 transfer_total_bytes += int(
@@ -394,7 +480,7 @@ class HostKVPoolRuntime:
                             moved_host_indices,
                             moved_device_indices,
                             self.controller.io_backend,
-                    )
+                        )
                     for transfer in moved_state_transfers:
                         entry = self.controller.mem_pool_host.entry_map.get(
                             transfer.name
@@ -453,14 +539,11 @@ class HostKVPoolRuntime:
 
             if staged.host_indices is not None:
                 put_start = time.perf_counter()
-                results = self.storage.batch_set_v1(
-                    staged.keys, staged.host_indices
-                )
+                results = self.storage.batch_set_v1(staged.keys, staged.host_indices)
                 kv_put_s = time.perf_counter() - put_start
                 if not all(results):
                     raise RuntimeError(
-                        f"Mooncake Host KV page put failed for {host_kv_id}: "
-                        f"{results}"
+                        f"Mooncake Host KV page put failed for {host_kv_id}: {results}"
                     )
 
             if staged.state_transfers:
@@ -481,18 +564,23 @@ class HostKVPoolRuntime:
                 kv_put_s=kv_put_s,
                 state_put_s=state_put_s,
                 metadata_put_s=0.0,
+                task_latency_s=ready_wait_s + kv_put_s + state_put_s,
                 transfer_total_bytes=staged.transfer_total_bytes,
             )
         finally:
             self._release_staged_write(staged)
 
-    def _backup_device_pages_to_host(self, device_indices: torch.Tensor) -> torch.Tensor:
+    def _backup_device_pages_to_host(
+        self, device_indices: torch.Tensor
+    ) -> torch.Tensor:
         host_indices = self.controller.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             raise RuntimeError(
                 "Host KV Pool staging allocation failed while backing up prefill KV"
             )
-        moved_host, moved_device = self.controller.move_indices(host_indices, device_indices)
+        moved_host, moved_device = self.controller.move_indices(
+            host_indices, device_indices
+        )
         self.controller.mem_pool_host.backup_from_device_all_layer(
             self.controller.mem_pool_device,
             moved_host,
@@ -519,7 +607,9 @@ class HostKVPoolRuntime:
     def _load_host_pages_to_device(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> None:
-        moved_host, moved_device = self.controller.move_indices(host_indices, device_indices)
+        moved_host, moved_device = self.controller.move_indices(
+            host_indices, device_indices
+        )
         for layer_id in range(self.controller.layer_num):
             self.controller.mem_pool_host.load_to_device_per_layer(
                 self.controller.mem_pool_device,
@@ -563,7 +653,9 @@ class HostKVPoolRuntime:
         return []
 
     def _pool_name_for_state_type(self, state_type) -> PoolName:
-        value = state_type.value if isinstance(state_type, StateType) else str(state_type)
+        value = (
+            state_type.value if isinstance(state_type, StateType) else str(state_type)
+        )
         if value == StateType.NSA.value:
             return PoolName.INDEXER
         raise RuntimeError(
@@ -616,7 +708,9 @@ class HostKVPoolRuntime:
                 continue
 
             pool_name = self._pool_name_for_state_type(state_types[idx])
-            entry = getattr(self.controller.mem_pool_host, "entry_map", {}).get(pool_name)
+            entry = getattr(self.controller.mem_pool_host, "entry_map", {}).get(
+                pool_name
+            )
             if entry is None:
                 raise RuntimeError(f"Host KV Pool missing host pool for {pool_name}")
 
@@ -755,7 +849,9 @@ class HostKVPoolRuntime:
                 )
         finally:
             self.controller.mem_pool_host.free(host_indices)
-        return int(device_indices.numel() * self.controller.mem_pool_host.size_per_token)
+        return int(
+            device_indices.numel() * self.controller.mem_pool_host.size_per_token
+        )
 
     def attach_pages(
         self,
@@ -869,9 +965,7 @@ class HostKVPoolRuntime:
         header_offset = len(_METADATA_MAGIC)
         header_len = struct.unpack("<I", payload[header_offset : header_offset + 4])[0]
         body_offset = header_offset + 4 + header_len
-        header = json.loads(
-            payload[header_offset + 4 : body_offset].decode("utf-8")
-        )
+        header = json.loads(payload[header_offset + 4 : body_offset].decode("utf-8"))
         object_info = HostKVObjectInfo(**header["object"])
         self._validate_object_info(req, object_info, source_tp_rank)
 
@@ -946,6 +1040,7 @@ class HostKVSender:
         self._final_future: Optional[Future] = None
         self._closed = False
         self._stats_logged = False
+        self._debug_stats: Optional[str] = None
 
     @property
     def kv_mgr(self):
@@ -972,7 +1067,9 @@ class HostKVSender:
             return
         if self.metadata_index is None:
             self.status = KVPoll.Failed
-            self.failure = RuntimeError("Host KV sender metadata index is not initialized")
+            self.failure = RuntimeError(
+                "Host KV sender metadata index is not initialized"
+            )
             return
 
         if self._push_start_s is None:
@@ -996,9 +1093,8 @@ class HostKVSender:
             metadata_index = self.metadata_index
 
             def commit() -> _HostKVPushResult:
-                result = self.runtime.commit_staged_write(
-                    self.req.host_kv_id, staged
-                )
+                task_start = time.perf_counter()
+                result = self.runtime.commit_staged_write(self.req.host_kv_id, staged)
                 if is_last:
                     for prior in prior_futures:
                         prior.result()
@@ -1016,6 +1112,7 @@ class HostKVSender:
                         state_page_counts=staged.state_page_counts,
                     )
                     result.metadata_put_s = time.perf_counter() - metadata_start
+                result.task_latency_s = time.perf_counter() - task_start
                 return result
 
             future = self.runtime.submit_push(commit)
@@ -1066,31 +1163,54 @@ class HostKVSender:
             self.status = KVPoll.Failed
             if self._push_start_s is not None:
                 self.transfer_latency_s = time.perf_counter() - self._push_start_s
-            logger.error(
-                "Host KV sender failed for %s: %s", self.req.rid, self.failure
-            )
+            logger.error("Host KV sender failed for %s: %s", self.req.rid, self.failure)
+            self.runtime.schedule_release(self.req, "sender_failed")
             return
 
-        self.transfer_latency_s = time.perf_counter() - self._push_start_s
         self.status = KVPoll.Success
         if not self._stats_logged:
             self._stats_logged = True
+            submit_ms = sum(result.submit_latency_s for result in results) * 1000
+            ready_wait_ms = sum(result.ready_wait_s for result in results) * 1000
+            kv_put_ms = sum(result.kv_put_s for result in results) * 1000
+            state_put_ms = sum(result.state_put_s for result in results) * 1000
+            metadata_put_ms = sum(result.metadata_put_s for result in results) * 1000
+            task_ms = sum(result.task_latency_s for result in results) * 1000
+            component_ms = (
+                submit_ms + ready_wait_ms + kv_put_ms + state_put_ms + metadata_put_ms
+            )
+            self.transfer_latency_s = component_ms / 1000
+            transfer_total_mb = self.transfer_total_bytes / (1 << 20)
+            self._debug_stats = (
+                f"HostKVPushStats(host_kv_id={self.req.host_kv_id}, "
+                f"pages={self.sent_pages}, total={component_ms:.2f}ms, "
+                f"task={task_ms:.2f}ms, "
+                f"submit={submit_ms:.2f}ms, ready_wait={ready_wait_ms:.2f}ms, "
+                f"kv_put={kv_put_ms:.2f}ms, state_put={state_put_ms:.2f}ms, "
+                f"metadata_put={metadata_put_ms:.2f}ms, "
+                f"transfer_total={transfer_total_mb:.2f}MB)"
+            )
             logger.info(
                 "HostKVPushStats(rid=%s, host_kv_id=%s, pages=%d): "
-                "total=%.2fms, submit=%.2fms, ready_wait=%.2fms, "
+                "total=%.2fms, task=%.2fms, submit=%.2fms, ready_wait=%.2fms, "
                 "kv_put=%.2fms, state_put=%.2fms, metadata_put=%.2fms, "
                 "transfer_total=%.2fMB",
                 self.req.rid,
                 self.req.host_kv_id,
                 self.sent_pages,
-                self.transfer_latency_s * 1000,
-                sum(result.submit_latency_s for result in results) * 1000,
-                sum(result.ready_wait_s for result in results) * 1000,
-                sum(result.kv_put_s for result in results) * 1000,
-                sum(result.state_put_s for result in results) * 1000,
-                sum(result.metadata_put_s for result in results) * 1000,
-                self.transfer_total_bytes / (1 << 20),
+                component_ms,
+                task_ms,
+                submit_ms,
+                ready_wait_ms,
+                kv_put_ms,
+                state_put_ms,
+                metadata_put_ms,
+                transfer_total_mb,
             )
+
+    def get_debug_stats(self) -> Optional[str]:
+        self._refresh_status()
+        return self._debug_stats
 
     def get_transfer_metric(self) -> KVTransferMetric:
         return KVTransferMetric(
@@ -1110,6 +1230,12 @@ class HostKVSender:
     def clear(self):
         self._push_futures.clear()
         self._final_future = None
+
+    def abort(self):
+        self._closed = True
+        self.status = KVPoll.Failed
+        self.failure = RuntimeError("Host KV sender aborted")
+        self.runtime.schedule_release(self.req, "sender_aborted")
 
 
 class HostKVReceiver:
@@ -1151,27 +1277,52 @@ class HostKVReceiver:
             return
 
         try:
+            total_start = time.perf_counter()
             self.status = KVPoll.Transferring
+            metadata_start = time.perf_counter()
             self.object_info = self.runtime.get_metadata(
                 self.req, self.metadata_buffers, aux_index
             )
-            self.runtime.attach_pages(
+            metadata_get_s = time.perf_counter() - metadata_start
+            kv_start = time.perf_counter()
+            attached_tokens = self.runtime.attach_pages(
                 self.req.host_kv_id,
                 kv_indices,
                 self.object_info.num_pages,
                 source_tp_rank=self.object_info.tp_rank,
             )
-            self.runtime.attach_state_pages(
+            kv_get_h2d_s = time.perf_counter() - kv_start
+            state_start = time.perf_counter()
+            attached_state_tokens = self.runtime.attach_state_pages(
                 self.req.host_kv_id,
                 state_indices,
                 self.object_info,
                 source_tp_rank=self.object_info.tp_rank,
             )
+            state_get_h2d_s = time.perf_counter() - state_start
+            self.req.host_kv_object_info = self.object_info
             self.status = KVPoll.Success
+            logger.info(
+                "HostKVPullStats(rid=%s, host_kv_id=%s, source_tp_rank=%d, "
+                "pages=%d): total=%.2fms, metadata_get=%.2fms, "
+                "kv_get_h2d=%.2fms, state_get_h2d=%.2fms, "
+                "attached_tokens=%d, attached_state_tokens=%d",
+                self.req.rid,
+                self.req.host_kv_id,
+                self.object_info.tp_rank,
+                self.object_info.num_pages,
+                (time.perf_counter() - total_start) * 1000,
+                metadata_get_s * 1000,
+                kv_get_h2d_s * 1000,
+                state_get_h2d_s * 1000,
+                attached_tokens,
+                attached_state_tokens,
+            )
         except BaseException as exc:
             self.status = KVPoll.Failed
             self.failure = exc
             logger.exception("Host KV receiver failed for %s", self.req.rid)
+            self.runtime.schedule_release(self.req, "receiver_failed")
 
     def poll(self) -> KVPoll:
         return self.status
@@ -1186,3 +1337,4 @@ class HostKVReceiver:
     def abort(self):
         self.status = KVPoll.Failed
         self.failure = RuntimeError("Host KV receiver aborted")
+        self.runtime.schedule_release(self.req, "receiver_aborted")

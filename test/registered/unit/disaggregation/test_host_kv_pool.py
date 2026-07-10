@@ -1,4 +1,5 @@
 import ctypes
+import re
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -8,7 +9,9 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.host_kv_pool import (
+    HostKVObjectInfo,
     HostKVPoolRuntime,
+    HostKVReceiver,
     HostKVSender,
     _HostKVPushResult,
 )
@@ -46,6 +49,8 @@ class FakeMetadataBuffers:
 class FakeStore:
     def __init__(self):
         self.values = {}
+        self.remove_patterns = []
+        self.remove_forces = []
 
     def put(self, key, payload):
         self.values[key] = payload
@@ -54,10 +59,25 @@ class FakeStore:
     def get(self, key):
         return self.values.get(key)
 
+    def remove_by_regex(self, pattern, force=False):
+        self.remove_patterns.append(pattern)
+        self.remove_forces.append(force)
+        matcher = re.compile(pattern)
+        removed = [key for key in self.values if matcher.search(key)]
+        for key in removed:
+            del self.values[key]
+        return len(removed)
+
 
 class FakeStorage:
-    def __init__(self):
+    def __init__(self, extra_backend_tag=None):
         self.store = FakeStore()
+        self.extra_backend_tag = extra_backend_tag
+
+    def _tag_keys(self, keys):
+        if self.extra_backend_tag is None:
+            return keys
+        return [f"{self.extra_backend_tag}_{key}" for key in keys]
 
 
 class DeferredPushRuntime:
@@ -65,9 +85,7 @@ class DeferredPushRuntime:
         self.tasks = []
         self.events = []
 
-    def stage_write(
-        self, host_kv_id, page_indices, start_page, state_indices=None
-    ):
+    def stage_write(self, host_kv_id, page_indices, start_page, state_indices=None):
         self.events.append(("stage", start_page, len(page_indices)))
         return SimpleNamespace(
             transfer_total_bytes=len(page_indices) * 1024,
@@ -83,6 +101,7 @@ class DeferredPushRuntime:
             kv_put_s=0.003,
             state_put_s=0.004,
             metadata_put_s=0.0,
+            task_latency_s=0.009,
             transfer_total_bytes=1024,
         )
 
@@ -264,7 +283,9 @@ class TestHostKVPoolMetadata(unittest.TestCase):
 
     def test_metadata_rejects_token_len_mismatch(self):
         runtime = make_host_kv_runtime()
-        prefill_req = SimpleNamespace(host_kv_id="host-kv-1", origin_input_ids=[1, 2, 3])
+        prefill_req = SimpleNamespace(
+            host_kv_id="host-kv-1", origin_input_ids=[1, 2, 3]
+        )
         decode_req = SimpleNamespace(host_kv_id="host-kv-1", origin_input_ids=[1, 2])
         metadata = FakeMetadataBuffers(item_lens=[3], rows=1)
         metadata.write_row(0, [b"abc"])
@@ -296,6 +317,133 @@ class TestHostKVPoolMetadata(unittest.TestCase):
         self.assertEqual(info.tp_rank, 1)
         self.assertEqual(decode_runtime.tp_rank, 9)
         self.assertEqual(dst.read_row(0), [b"abc"])
+
+
+class TestHostKVPoolLifecycle(unittest.TestCase):
+    def test_release_removes_only_the_source_rank_object_and_is_idempotent(self):
+        storage = FakeStorage(extra_backend_tag="model-a")
+        runtime = make_host_kv_runtime(tp_rank=9, pp_rank=2, storage=storage)
+
+        def submit_immediately(fn):
+            future = Future()
+            try:
+                future.set_result(fn())
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+        runtime.submit_push = submit_immediately
+        storage.store.values.update(
+            {
+                "model-a_hostkv:kv-1:tp1:pp2:page0_mla_k": b"kv",
+                "model-a_hostkv:kv-1:tp1:pp2:page0_mla_indexer": b"state",
+                "model-a_hostkv:kv-1:tp1:pp2:meta": b"meta",
+                "model-a_hostkv:kv-1:tp9:pp2:meta": b"other-rank",
+                "model-a_hostkv:kv-2:tp1:pp2:meta": b"other-object",
+            }
+        )
+        req = SimpleNamespace(
+            rid="req-1",
+            host_kv_id="kv-1",
+            disagg_prefill_dp_rank=1,
+            host_kv_object_info=None,
+            host_kv_release_scheduled=False,
+        )
+
+        future = runtime.schedule_release(req, "decode_finished")
+        duplicate = runtime.schedule_release(req, "decode_finished")
+
+        self.assertIsNone(duplicate)
+        self.assertEqual(future.result()[0], 3)
+        self.assertEqual(
+            storage.store.remove_patterns,
+            [r"model\-a_hostkv:kv\-1:tp1:pp2:.*"],
+        )
+        self.assertEqual(storage.store.remove_forces, [True])
+        self.assertEqual(
+            set(storage.store.values),
+            {
+                "model-a_hostkv:kv-1:tp9:pp2:meta",
+                "model-a_hostkv:kv-2:tp1:pp2:meta",
+            },
+        )
+
+
+class FakePullRuntime:
+    def __init__(self):
+        self.calls = []
+        self.release_reasons = []
+        self.info = HostKVObjectInfo(
+            host_kv_id="host-kv-1",
+            token_len=3,
+            page_size=16,
+            num_pages=2,
+            tp_rank=1,
+            pp_rank=0,
+            layout="page_first",
+            dtype="float16",
+            is_mla_backend=True,
+            state_page_counts={"indexer": 1},
+        )
+
+    def get_metadata(self, req, metadata_buffers, metadata_index):
+        self.calls.append(("metadata", metadata_index))
+        return self.info
+
+    def attach_pages(
+        self, host_kv_id, page_indices, expected_num_pages, source_tp_rank=None
+    ):
+        self.calls.append(
+            ("pages", host_kv_id, len(page_indices), expected_num_pages, source_tp_rank)
+        )
+        return 32
+
+    def attach_state_pages(
+        self, host_kv_id, state_indices, object_info, source_tp_rank=None
+    ):
+        self.calls.append(("state", host_kv_id, source_tp_rank))
+        return 16
+
+    def schedule_release(self, req, reason):
+        self.release_reasons.append(reason)
+
+
+class TestHostKVReceiver(unittest.TestCase):
+    def test_attach_records_object_info_for_request_lifecycle(self):
+        runtime = FakePullRuntime()
+        req = SimpleNamespace(
+            rid="req-1",
+            host_kv_id="host-kv-1",
+            host_kv_object_info=None,
+        )
+        receiver = HostKVReceiver(runtime, req, metadata_buffers=object())
+
+        receiver.send_metadata(
+            np.asarray([4, 5], dtype=np.int32),
+            aux_index=3,
+            state_indices=[[6]],
+        )
+
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        self.assertIs(req.host_kv_object_info, runtime.info)
+        self.assertEqual(
+            runtime.calls,
+            [
+                ("metadata", 3),
+                ("pages", "host-kv-1", 2, 2, 1),
+                ("state", "host-kv-1", 1),
+            ],
+        )
+
+    def test_abort_schedules_object_release(self):
+        runtime = FakePullRuntime()
+        req = SimpleNamespace(rid="req-1", host_kv_id="host-kv-1")
+        receiver = HostKVReceiver(runtime, req, metadata_buffers=object())
+
+        receiver.abort()
+
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertEqual(runtime.release_reasons, ["receiver_aborted"])
 
 
 class TestHostKVSenderAsyncPush(unittest.TestCase):

@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.host_kv_pool import (
     HostKVPoolRuntime,
     HostKVReceiver,
     HostKVSender,
+    _HostKVFetchResult,
     _HostKVPushResult,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -373,6 +374,8 @@ class FakePullRuntime:
     def __init__(self):
         self.calls = []
         self.release_reasons = []
+        self.tasks = []
+        self.attach_ready = False
         self.info = HostKVObjectInfo(
             host_kv_id="host-kv-1",
             token_len=3,
@@ -385,6 +388,59 @@ class FakePullRuntime:
             is_mla_backend=True,
             state_page_counts={"indexer": 1},
         )
+
+    def stage_read(self, req, page_indices, state_indices=None):
+        self.calls.append(("stage", len(page_indices), state_indices))
+        return SimpleNamespace(
+            attach_failure=None,
+            attach_start_s=None,
+            released=False,
+        )
+
+    def submit_pull(self, fn):
+        future = Future()
+        future.set_running_or_notify_cancel()
+        self.tasks.append((fn, future))
+        return future
+
+    def run_all(self):
+        while self.tasks:
+            fn, future = self.tasks.pop(0)
+            try:
+                future.set_result(fn())
+            except BaseException as exc:
+                future.set_exception(exc)
+
+    def fetch_staged_read(
+        self, req, metadata_buffers, metadata_index, staged, submitted_at
+    ):
+        info = self.get_metadata(req, metadata_buffers, metadata_index)
+        attached_tokens = self.attach_pages(
+            req.host_kv_id, np.asarray([4, 5]), info.num_pages, info.tp_rank
+        )
+        attached_state_tokens = self.attach_state_pages(
+            req.host_kv_id, [[6]], info, info.tp_rank
+        )
+        return _HostKVFetchResult(
+            object_info=info,
+            queue_wait_s=0.001,
+            metadata_get_s=0.002,
+            kv_get_s=0.003,
+            state_get_s=0.004,
+            attached_tokens=attached_tokens,
+            attached_state_tokens=attached_state_tokens,
+        )
+
+    def start_staged_read_attach(self, staged):
+        self.calls.append(("attach",))
+        staged.attach_start_s = 0.0
+
+    def staged_read_ready(self, staged):
+        return self.attach_ready
+
+    def release_staged_read(self, staged):
+        staged.released = True
+        self.calls.append(("release",))
 
     def get_metadata(self, req, metadata_buffers, metadata_index):
         self.calls.append(("metadata", metadata_index))
@@ -409,7 +465,7 @@ class FakePullRuntime:
 
 
 class TestHostKVReceiver(unittest.TestCase):
-    def test_attach_records_object_info_for_request_lifecycle(self):
+    def test_pull_and_attach_are_polled_asynchronously(self):
         runtime = FakePullRuntime()
         req = SimpleNamespace(
             rid="req-1",
@@ -424,16 +480,51 @@ class TestHostKVReceiver(unittest.TestCase):
             state_indices=[[6]],
         )
 
+        self.assertEqual(receiver.poll(), KVPoll.Transferring)
+        self.assertEqual(runtime.calls, [("stage", 2, [[6]])])
+
+        runtime.run_all()
+
+        self.assertEqual(receiver.poll(), KVPoll.Transferring)
+        self.assertEqual(runtime.calls[-1], ("attach",))
+
+        runtime.attach_ready = True
+
         self.assertEqual(receiver.poll(), KVPoll.Success)
         self.assertIs(req.host_kv_object_info, runtime.info)
         self.assertEqual(
             runtime.calls,
             [
+                ("stage", 2, [[6]]),
                 ("metadata", 3),
                 ("pages", "host-kv-1", 2, 2, 1),
                 ("state", "host-kv-1", 1),
+                ("attach",),
+                ("release",),
             ],
         )
+
+    def test_abort_waits_for_running_fetch_before_releasing_buffers(self):
+        runtime = FakePullRuntime()
+        req = SimpleNamespace(
+            rid="req-1",
+            host_kv_id="host-kv-1",
+            host_kv_object_info=None,
+        )
+        receiver = HostKVReceiver(runtime, req, metadata_buffers=object())
+        receiver.send_metadata(np.asarray([4, 5], dtype=np.int32), aux_index=3)
+
+        receiver.abort()
+
+        self.assertEqual(receiver.poll(), KVPoll.Transferring)
+        self.assertNotIn(("release",), runtime.calls)
+
+        runtime.run_all()
+
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertIn(("release",), runtime.calls)
+        self.assertNotIn(("attach",), runtime.calls)
+        self.assertEqual(runtime.release_reasons, ["receiver_aborted"])
 
     def test_abort_schedules_object_release(self):
         runtime = FakePullRuntime()

@@ -85,6 +85,36 @@ class _HostKVPushResult:
     transfer_total_bytes: int
 
 
+@dataclass
+class _HostKVStagedRead:
+    host_kv_id: str
+    source_tp_rank: int
+    num_pages: int
+    host_indices: Optional[torch.Tensor]
+    moved_host_indices: Optional[torch.Tensor]
+    moved_device_indices: Optional[torch.Tensor]
+    state_transfers: List[PoolTransfer]
+    moved_state_transfers: List[PoolTransfer]
+    dependency_events: List[object]
+    transfer_total_bytes: int
+    state_page_counts: dict[str, int]
+    ready_event: Optional[object] = None
+    attach_failure: Optional[BaseException] = None
+    attach_start_s: Optional[float] = None
+    released: bool = False
+
+
+@dataclass
+class _HostKVFetchResult:
+    object_info: HostKVObjectInfo
+    queue_wait_s: float
+    metadata_get_s: float
+    kv_get_s: float
+    state_get_s: float
+    attached_tokens: int
+    attached_state_tokens: int
+
+
 def _expand_page_indices(
     page_indices: npt.NDArray[np.int32], page_size: int, device: str
 ) -> torch.Tensor:
@@ -114,6 +144,9 @@ class HostKVPoolRuntime:
         self._push_stream = None
         self._push_executor: Optional[ThreadPoolExecutor] = None
         self._push_executor_lock = threading.Lock()
+        self._pull_stream = None
+        self._pull_executor: Optional[ThreadPoolExecutor] = None
+        self._pull_executor_lock = threading.Lock()
 
     @classmethod
     def get_or_create(cls, scheduler: Scheduler) -> "HostKVPoolRuntime":
@@ -275,6 +308,22 @@ class HostKVPoolRuntime:
                     )
         return self._push_executor.submit(fn)
 
+    def _get_pull_stream(self):
+        if self._pull_stream is None:
+            self._pull_stream = get_device_module().Stream()
+        return self._pull_stream
+
+    def submit_pull(self, fn: Callable[[], object]) -> Future:
+        """Run blocking Mooncake reads outside the decode scheduler thread."""
+        if self._pull_executor is None:
+            with self._pull_executor_lock:
+                if self._pull_executor is None:
+                    self._pull_executor = ThreadPoolExecutor(
+                        max_workers=4,
+                        thread_name_prefix=f"host-kv-pull-tp{self.tp_rank}",
+                    )
+        return self._pull_executor.submit(fn)
+
     def schedule_release(self, req: Req, reason: str) -> Optional[Future]:
         """Remove one logical Host KV Object after its request lifetime ends."""
         host_kv_id = getattr(req, "host_kv_id", None)
@@ -398,6 +447,242 @@ class HostKVPoolRuntime:
             tensor.record_stream(stream)
 
     def _release_staged_write(self, staged: _HostKVStagedWrite) -> None:
+        if staged.host_indices is not None:
+            self.controller.mem_pool_host.free(staged.host_indices)
+        self._free_state_pool_transfers(staged.state_transfers)
+
+    def _record_pull_dependencies(self) -> List[object]:
+        """Fence index setup and HBM reuse against already queued GPU work."""
+        device_module = get_device_module()
+        schedule_event = device_module.Event()
+        schedule_event.record()
+        events = [schedule_event]
+        forward_stream = (
+            getattr(self.scheduler, "forward_stream", None)
+            if getattr(self.scheduler, "enable_overlap", False)
+            else None
+        )
+        if forward_stream is not None:
+            forward_event = device_module.Event()
+            forward_event.record(forward_stream)
+            events.append(forward_event)
+        return events
+
+    def stage_read(
+        self,
+        req: Req,
+        page_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+    ) -> _HostKVStagedRead:
+        """Reserve staging buffers and destination indices without doing I/O."""
+        host_indices = None
+        state_transfers: List[PoolTransfer] = []
+        source_tp_rank = self._source_tp_rank(req)
+
+        try:
+            num_pages = len(page_indices)
+            moved_host_indices = None
+            moved_device_indices = None
+            transfer_total_bytes = 0
+            if num_pages > 0:
+                device_indices = _expand_page_indices(
+                    page_indices, self.page_size, self.controller.device
+                )
+                host_indices = self.controller.mem_pool_host.alloc(
+                    num_pages * self.page_size
+                )
+                if host_indices is None:
+                    raise RuntimeError(
+                        "Host KV Pool staging allocation failed while fetching "
+                        "decode KV"
+                    )
+                moved_host_indices, moved_device_indices = self.controller.move_indices(
+                    host_indices, device_indices
+                )
+                transfer_total_bytes += int(
+                    device_indices.numel()
+                    * self.controller.mem_pool_host.size_per_token
+                )
+
+            state_transfers = self._build_state_pool_transfers(
+                req.host_kv_id, state_indices, tp_rank=source_tp_rank
+            )
+            moved_state_transfers = []
+            for transfer in state_transfers:
+                moved_host, moved_device = self.controller.move_indices(
+                    transfer.host_indices, transfer.device_indices
+                )
+                moved_state_transfers.append(
+                    PoolTransfer(
+                        name=transfer.name,
+                        host_indices=moved_host,
+                        device_indices=moved_device,
+                        keys=transfer.keys,
+                    )
+                )
+                entry = self.controller.mem_pool_host.entry_map[transfer.name]
+                transfer_total_bytes += int(
+                    transfer.device_indices.numel() * entry.host_pool.size_per_token
+                )
+
+            state_page_counts = {
+                transfer.name.value: len(transfer.keys or [])
+                for transfer in state_transfers
+            }
+            dependency_events = []
+            if host_indices is not None or moved_state_transfers:
+                dependency_events = self._record_pull_dependencies()
+
+            return _HostKVStagedRead(
+                host_kv_id=req.host_kv_id,
+                source_tp_rank=source_tp_rank,
+                num_pages=num_pages,
+                host_indices=host_indices,
+                moved_host_indices=moved_host_indices,
+                moved_device_indices=moved_device_indices,
+                state_transfers=state_transfers,
+                moved_state_transfers=moved_state_transfers,
+                dependency_events=dependency_events,
+                transfer_total_bytes=transfer_total_bytes,
+                state_page_counts=state_page_counts,
+            )
+        except BaseException:
+            if host_indices is not None:
+                self.controller.mem_pool_host.free(host_indices)
+            self._free_state_pool_transfers(state_transfers)
+            raise
+
+    def fetch_staged_read(
+        self,
+        req: Req,
+        metadata_buffers: MetadataBuffers,
+        metadata_index: int,
+        staged: _HostKVStagedRead,
+        submitted_at: float,
+    ) -> _HostKVFetchResult:
+        """Fetch metadata and KV into pinned host buffers on a worker thread."""
+        fetch_start = time.perf_counter()
+        metadata_start = time.perf_counter()
+        object_info = self.get_metadata(req, metadata_buffers, metadata_index)
+        metadata_get_s = time.perf_counter() - metadata_start
+
+        if staged.num_pages != object_info.num_pages:
+            raise RuntimeError(
+                f"Host KV Object page count mismatch for {req.host_kv_id}: "
+                f"decode={staged.num_pages}, object={object_info.num_pages}"
+            )
+        if staged.state_page_counts != (object_info.state_page_counts or {}):
+            raise RuntimeError(
+                f"Host KV Object state page count mismatch for {req.host_kv_id}: "
+                f"decode={staged.state_page_counts}, "
+                f"object={object_info.state_page_counts or {}}"
+            )
+
+        kv_get_s = 0.0
+        if staged.host_indices is not None:
+            kv_start = time.perf_counter()
+            keys = self._page_keys(
+                staged.host_kv_id,
+                0,
+                staged.num_pages,
+                tp_rank=staged.source_tp_rank,
+            )
+            results = self.storage.batch_get_v1(keys, staged.host_indices)
+            kv_get_s = time.perf_counter() - kv_start
+            if not all(results):
+                raise RuntimeError(
+                    f"Mooncake Host KV page get failed for {staged.host_kv_id}: "
+                    f"{results}"
+                )
+
+        state_get_s = 0.0
+        if staged.state_transfers:
+            state_start = time.perf_counter()
+            results = self.storage.batch_get_v2(staged.state_transfers)
+            state_get_s = time.perf_counter() - state_start
+            for transfer in staged.state_transfers:
+                pool_results = results.get(transfer.name, [])
+                if not all(pool_results):
+                    raise RuntimeError(
+                        f"Mooncake Host KV state get failed for {staged.host_kv_id} "
+                        f"pool={transfer.name}: {pool_results}"
+                    )
+
+        return _HostKVFetchResult(
+            object_info=object_info,
+            queue_wait_s=fetch_start - submitted_at,
+            metadata_get_s=metadata_get_s,
+            kv_get_s=kv_get_s,
+            state_get_s=state_get_s,
+            attached_tokens=staged.num_pages * self.page_size,
+            attached_state_tokens=sum(
+                int(transfer.device_indices.numel())
+                for transfer in staged.state_transfers
+            ),
+        )
+
+    def start_staged_read_attach(self, staged: _HostKVStagedRead) -> None:
+        """Enqueue host-to-device copies and return without synchronizing."""
+        if staged.host_indices is None and not staged.moved_state_transfers:
+            return
+
+        device_module = get_device_module()
+        pull_stream = self._get_pull_stream()
+        ready_event = device_module.Event()
+        staged.ready_event = ready_event
+        staged.attach_start_s = time.perf_counter()
+
+        try:
+            with device_module.stream(pull_stream):
+                for dependency_event in staged.dependency_events:
+                    dependency_event.wait(pull_stream)
+                if staged.host_indices is not None:
+                    for layer_id in range(self.controller.layer_num):
+                        self.controller.mem_pool_host.load_to_device_per_layer(
+                            self.controller.mem_pool_device,
+                            staged.moved_host_indices,
+                            staged.moved_device_indices,
+                            layer_id,
+                            self.controller.io_backend,
+                        )
+                for transfer in staged.moved_state_transfers:
+                    entry = self.controller.mem_pool_host.entry_map.get(transfer.name)
+                    if entry is None:
+                        raise RuntimeError(
+                            f"Host KV Pool missing host pool for {transfer.name}"
+                        )
+                    for layer_id in range(self.controller.layer_num):
+                        local_layer_id = entry.layer_mapper(layer_id)
+                        if local_layer_id is None:
+                            continue
+                        entry.host_pool.load_to_device_per_layer(
+                            entry.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.controller.io_backend,
+                        )
+                ready_event.record()
+                self._record_tensor_on_stream(staged.moved_host_indices, pull_stream)
+                self._record_tensor_on_stream(staged.moved_device_indices, pull_stream)
+                for transfer in staged.moved_state_transfers:
+                    self._record_tensor_on_stream(transfer.host_indices, pull_stream)
+                    self._record_tensor_on_stream(transfer.device_indices, pull_stream)
+        except BaseException as exc:
+            staged.attach_failure = exc
+            # Kernels may already have been queued before a later layer failed.
+            # Put the completion marker after them so buffers are not recycled early.
+            with device_module.stream(pull_stream):
+                ready_event.record()
+
+    @staticmethod
+    def staged_read_ready(staged: _HostKVStagedRead) -> bool:
+        return staged.ready_event is None or staged.ready_event.query()
+
+    def release_staged_read(self, staged: _HostKVStagedRead) -> None:
+        if staged.released:
+            return
+        staged.released = True
         if staged.host_indices is not None:
             self.controller.mem_pool_host.free(staged.host_indices)
         self._free_state_pool_transfers(staged.state_transfers)
@@ -1254,6 +1539,14 @@ class HostKVReceiver:
         self.failure: Optional[BaseException] = None
         self.object_info: Optional[HostKVObjectInfo] = None
         self.require_staging = False
+        self._staged_read: Optional[_HostKVStagedRead] = None
+        self._fetch_future: Optional[Future] = None
+        self._fetch_result: Optional[_HostKVFetchResult] = None
+        self._attach_started = False
+        self._aborted = False
+        self._release_requested = False
+        self._pull_start_s: Optional[float] = None
+        self._stats_logged = False
 
     def init(self, prefill_dp_rank: int):
         self.status = KVPoll.WaitingForInput
@@ -1275,66 +1568,162 @@ class HostKVReceiver:
             self.status = KVPoll.Failed
             self.failure = RuntimeError("Host KV receiver metadata index is missing")
             return
+        if self._fetch_future is not None or self._attach_started:
+            self.status = KVPoll.Failed
+            self.failure = RuntimeError("Host KV receiver pull was submitted twice")
+            return
 
         try:
-            total_start = time.perf_counter()
+            self._pull_start_s = time.perf_counter()
             self.status = KVPoll.Transferring
-            metadata_start = time.perf_counter()
-            self.object_info = self.runtime.get_metadata(
-                self.req, self.metadata_buffers, aux_index
+            self._staged_read = self.runtime.stage_read(
+                self.req,
+                np.asarray(kv_indices, dtype=np.int32).copy(),
+                state_indices=state_indices,
             )
-            metadata_get_s = time.perf_counter() - metadata_start
-            kv_start = time.perf_counter()
-            attached_tokens = self.runtime.attach_pages(
-                self.req.host_kv_id,
-                kv_indices,
-                self.object_info.num_pages,
-                source_tp_rank=self.object_info.tp_rank,
-            )
-            kv_get_h2d_s = time.perf_counter() - kv_start
-            state_start = time.perf_counter()
-            attached_state_tokens = self.runtime.attach_state_pages(
-                self.req.host_kv_id,
-                state_indices,
-                self.object_info,
-                source_tp_rank=self.object_info.tp_rank,
-            )
-            state_get_h2d_s = time.perf_counter() - state_start
-            self.req.host_kv_object_info = self.object_info
-            self.status = KVPoll.Success
-            logger.info(
-                "HostKVPullStats(rid=%s, host_kv_id=%s, source_tp_rank=%d, "
-                "pages=%d): total=%.2fms, metadata_get=%.2fms, "
-                "kv_get_h2d=%.2fms, state_get_h2d=%.2fms, "
-                "attached_tokens=%d, attached_state_tokens=%d",
-                self.req.rid,
-                self.req.host_kv_id,
-                self.object_info.tp_rank,
-                self.object_info.num_pages,
-                (time.perf_counter() - total_start) * 1000,
-                metadata_get_s * 1000,
-                kv_get_h2d_s * 1000,
-                state_get_h2d_s * 1000,
-                attached_tokens,
-                attached_state_tokens,
-            )
+            submitted_at = time.perf_counter()
+
+            def fetch() -> _HostKVFetchResult:
+                return self.runtime.fetch_staged_read(
+                    self.req,
+                    self.metadata_buffers,
+                    aux_index,
+                    self._staged_read,
+                    submitted_at,
+                )
+
+            self._fetch_future = self.runtime.submit_pull(fetch)
         except BaseException as exc:
-            self.status = KVPoll.Failed
-            self.failure = exc
-            logger.exception("Host KV receiver failed for %s", self.req.rid)
-            self.runtime.schedule_release(self.req, "receiver_failed")
+            if self._staged_read is not None:
+                self.runtime.release_staged_read(self._staged_read)
+            self._finish_failure(exc, "receiver_submit_failed")
+
+    def _schedule_release_once(self, reason: str) -> None:
+        if self._release_requested:
+            return
+        self._release_requested = True
+        self.runtime.schedule_release(self.req, reason)
+
+    def _finish_failure(self, exc: BaseException, reason: str) -> None:
+        self.failure = self.failure or exc
+        if self._staged_read is not None:
+            self.runtime.release_staged_read(self._staged_read)
+        self.status = KVPoll.Failed
+        self._schedule_release_once(reason)
+        logger.error("Host KV receiver failed for %s: %s", self.req.rid, self.failure)
+
+    def _log_success(self) -> None:
+        if self._stats_logged or self._fetch_result is None:
+            return
+        self._stats_logged = True
+        now = time.perf_counter()
+        total_s = now - self._pull_start_s if self._pull_start_s is not None else 0.0
+        h2d_s = (
+            now - self._staged_read.attach_start_s
+            if self._staged_read is not None
+            and self._staged_read.attach_start_s is not None
+            else 0.0
+        )
+        result = self._fetch_result
+        logger.info(
+            "HostKVPullStats(rid=%s, host_kv_id=%s, source_tp_rank=%d, "
+            "pages=%d): total=%.2fms, queue_wait=%.2fms, "
+            "metadata_get=%.2fms, kv_get=%.2fms, state_get=%.2fms, "
+            "h2d=%.2fms, kv_get_h2d=%.2fms, state_get_h2d=%.2fms, "
+            "attached_tokens=%d, attached_state_tokens=%d",
+            self.req.rid,
+            self.req.host_kv_id,
+            result.object_info.tp_rank,
+            result.object_info.num_pages,
+            total_s * 1000,
+            result.queue_wait_s * 1000,
+            result.metadata_get_s * 1000,
+            result.kv_get_s * 1000,
+            result.state_get_s * 1000,
+            h2d_s * 1000,
+            (result.kv_get_s + h2d_s) * 1000,
+            result.state_get_s * 1000,
+            result.attached_tokens,
+            result.attached_state_tokens,
+        )
+
+    def _refresh_status(self) -> None:
+        if self.status in (KVPoll.Success, KVPoll.Failed):
+            return
+        if self._fetch_future is None or not self._fetch_future.done():
+            return
+
+        if self._fetch_result is None:
+            try:
+                self._fetch_result = self._fetch_future.result()
+            except BaseException as exc:
+                if self._aborted and self.failure is not None:
+                    exc = self.failure
+                self._finish_failure(
+                    exc, "receiver_aborted" if self._aborted else "receiver_failed"
+                )
+                return
+
+            if self._aborted:
+                self._finish_failure(
+                    self.failure or RuntimeError("Host KV receiver aborted"),
+                    "receiver_aborted",
+                )
+                return
+
+        if not self._attach_started:
+            try:
+                self.runtime.start_staged_read_attach(self._staged_read)
+                self._attach_started = True
+            except BaseException as exc:
+                self._finish_failure(exc, "receiver_attach_failed")
+                return
+
+        if not self.runtime.staged_read_ready(self._staged_read):
+            return
+        if self._staged_read.attach_failure is not None:
+            self._finish_failure(
+                self._staged_read.attach_failure, "receiver_attach_failed"
+            )
+            return
+        if self._aborted:
+            self._finish_failure(
+                self.failure or RuntimeError("Host KV receiver aborted"),
+                "receiver_aborted",
+            )
+            return
+
+        self.object_info = self._fetch_result.object_info
+        self.req.host_kv_object_info = self.object_info
+        self._log_success()
+        self.runtime.release_staged_read(self._staged_read)
+        self.status = KVPoll.Success
 
     def poll(self) -> KVPoll:
+        self._refresh_status()
         return self.status
 
     def failure_exception(self):
+        self._refresh_status()
         if self.failure is not None:
             raise self.failure
 
     def clear(self):
-        pass
+        self._fetch_future = None
+        self._fetch_result = None
+        self._staged_read = None
 
     def abort(self):
-        self.status = KVPoll.Failed
+        if self.status in (KVPoll.Success, KVPoll.Failed):
+            return
+        self._aborted = True
         self.failure = RuntimeError("Host KV receiver aborted")
-        self.runtime.schedule_release(self.req, "receiver_aborted")
+        if self._fetch_future is None:
+            self._finish_failure(self.failure, "receiver_aborted")
+            return
+        if self._fetch_future.cancel():
+            self._finish_failure(self.failure, "receiver_aborted")
+            return
+        # A running fetch or H2D must retain its buffers and destination pages.
+        # poll() finalizes the abort only after that in-flight work is safe.
+        self.status = KVPoll.Transferring
